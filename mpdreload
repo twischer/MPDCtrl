@@ -1,0 +1,22 @@
+#!/usr/bin/perl -w
+use strict;
+use warnings;
+use utf8;
+use Audio::MPD();
+
+my $MIN_PLAYLIST_LENGTH = 50;
+
+
+my $objMPD = new Audio::MPD('conntype' => $Audio::MPD::REUSE);
+
+# Playlist neu erstellen wenn nur noch 10 lieder enthalten sind
+my $PLLength = $objMPD->status->playlistlength();
+if ( (defined $PLLength) and ($PLLength < $MIN_PLAYLIST_LENGTH) )
+{
+	$objMPD->updatedb();
+	sleep(1) while( defined $objMPD->status->updating_db() );
+
+	$objMPD->playlist->clear();
+	$objMPD->playlist->add("/");
+	$objMPD->play();
+}
