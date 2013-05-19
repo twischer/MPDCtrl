@@ -1,0 +1,395 @@
+#!/usr/bin/perl -w
+use strict;
+use warnings;
+use utf8;
+use Audio::MPD();
+use File::Basename();
+use POSIX();
+use Storable();
+use File::Copy();
+use Thread();
+use Thread::Queue();
+use Time::HiRes();
+#use EV();
+
+
+chdir(  File::Basename::dirname( $0 )  );
+require Logger;
+require LIRC;
+require Server;
+require Display::GLCD;
+
+
+my $MUSIC_DIR = "/media/music/good";
+my $SORTOUT_DIR = "/media/music/sortout";
+my $ERROR_DIR = "/media/music/error";
+my $SORTOUT_FILE = "/var/cache/mpd-sortout-file";
+
+
+my $m_nCurSong = -1;
+my $m_nTimeTotal = 0;
+my $m_nTimeElapsed = 0;
+my $m_szCurSong = "";
+my $m_szLastSong = "";
+my $m_szState = "";
+my $m_fMainScreenIsInit = 0;
+my $m_fWorking = 1;
+my $m_szInfo = "";
+my $m_nInfoTimer = 0;
+my $m_nLocalTime = 0;
+
+
+$SIG{'TERM'} = sub { $m_fWorking = 0; };
+
+my $pobjGLCD = Display::GLCD->new();
+$pobjGLCD->Clear(0, 7);
+$pobjGLCD->SetXY(16, 0);
+$pobjGLCD->Print( "Player" , 2  );
+$pobjGLCD->SetXY(32, 2);
+$pobjGLCD->Print( "wird" , 2  );
+$pobjGLCD->SetXY(32, 4);
+$pobjGLCD->Print( "hoch" , 2  );
+$pobjGLCD->SetXY(0, 6);
+$pobjGLCD->Print( "gefahren" , 2  );
+
+my $m_pobjQueue = Thread::Queue->new();
+my $m_pobjLIRC = LIRC->new( $m_pobjQueue );
+my $m_pobjServer = Server->new( $m_pobjQueue );
+
+
+Logger->GetInstance()->Write( undef, 2, "Connecting to MPD ...");
+my $objMPD;
+while($m_fWorking == 1)
+{
+	eval
+	{
+		$objMPD = new Audio::MPD('CONNTYPE' => $Audio::MPD::REUSE);
+	};
+	
+	if ($@)
+	{
+		Logger->GetInstance()->Write( undef, 1, "MPD not available: $@" );
+		sleep 2;
+	}
+	else
+	{
+		last;
+	}
+}
+
+while ( ($m_fWorking == 1) and ($objMPD->ping() != 0) )
+{
+	sleep 1;
+}
+Logger->GetInstance()->Write( undef, 2, "MPD Connected" );
+
+#$objMPD->next();
+do
+{
+	$objMPD->play();
+}
+while ($objMPD->status->state() ne "play");
+
+
+$pobjGLCD->Clear(0, 7);
+
+#my $w = EV::timer( 2, 0, sub {})
+
+#$SIG{'ALRM'} = \&RefreshDisplay;
+#Time::HiRes::alarm( 1.0, 1.0 );
+
+while ($m_fWorking == 1)
+{
+	RefreshDisplay();
+	
+	foreach (0..99)
+	{
+		ExecReceivedCommands();
+		Time::HiRes::sleep( 1/100 );
+	}
+}
+
+if (defined $objMPD)
+{
+#	$objMPD->pause();
+}
+
+
+$pobjGLCD->DeleteScrollingText(0);
+$pobjGLCD->DeleteScrollingText(1);
+
+$pobjGLCD->Clear(0, 7);
+$pobjGLCD->SetXY(16, 0);
+$pobjGLCD->Print( "Player" , 2  );
+$pobjGLCD->SetXY(32, 2);
+$pobjGLCD->Print( "wird" , 2  );
+$pobjGLCD->SetXY(0, 4);
+$pobjGLCD->Print( "herunter" , 2  );
+$pobjGLCD->SetXY(0, 6);
+$pobjGLCD->Print( "gefahren" , 2  );
+
+$pobjGLCD->Destroy();
+
+Logger->GetInstance()->Write( undef, 2, "Beendet" );
+exit(0);
+
+sub RefreshDisplay
+{
+	if ( IsMPDAvailable() == 1 )
+	{
+		my $nCurSong = $objMPD->current->pos;
+		$m_nCurSong = $nCurSong if ($m_nCurSong < 0);	# init variable
+		
+		# is a new file playing?
+		if ( ($nCurSong != $m_nCurSong) or ($m_fMainScreenIsInit == 0) )
+		{
+			if ($nCurSong != $m_nCurSong)
+			{
+				Logger->GetInstance()->Write( undef, 2, "Delete Song ".$m_nCurSong );
+				$objMPD->playlist->delete( $m_nCurSong );
+				
+				$m_nCurSong = $objMPD->current->pos;
+				
+				
+				$m_szLastSong = $m_szCurSong;
+				
+				
+				# Playlist neu erstellen wenn nur noch 10 lieder enthalten sind
+				my $PLLength = $objMPD->status->playlistlength();
+				if ( (defined $PLLength) and ($PLLength < 10) )
+				{
+					Logger->GetInstance()->Write( undef, 2, "Create new playlist ... (Length: $PLLength)" );
+					
+					$objMPD->updatedb();
+					sleep(1) while( defined $objMPD->status->updating_db() );
+					Logger->GetInstance()->Write( undef, 2, "DB updated" );
+			
+					$objMPD->playlist->clear();
+					$objMPD->playlist->add("/");
+					$objMPD->play();
+				}
+			}
+			
+			
+			$m_nTimeElapsed = $objMPD->status->time->seconds_sofar();
+			$m_nTimeTotal = $objMPD->status->time->seconds_total();
+			
+			
+			$m_szCurSong = $objMPD->current->file();
+			Logger->GetInstance()->Write( undef, 2, "New Song is playing '$m_szCurSong'" );
+			
+			my $szArtist = "";
+			my $szTitle = $m_szCurSong;
+			if ($szTitle =~ m/^(.*)\.mp3/i)
+			{
+				$szTitle = $1;
+			}
+			if ($szTitle =~m/^(.*) - (.*)$/ or $szTitle =~m/^(.*)-(.*)$/)
+			{
+				$szArtist = $1;
+				$szTitle = $2;
+			}
+			$pobjGLCD->SetScrollingText(0, 0, $szArtist, 1);
+			$pobjGLCD->SetScrollingText(1, 1, $szTitle, 2);
+		}
+		
+		# Update display info
+		my $szState = $objMPD->status->state();
+		if ( ($m_szState ne $szState) or ($m_fMainScreenIsInit == 0) )
+		{
+			Logger->GetInstance()->Write( undef, 2, "Playing status changed to '$szState'" );
+			$pobjGLCD->Clear(3, 3);
+			
+			$pobjGLCD->SetXY(80, 3);
+			$pobjGLCD->Print(  ucfirst( $szState ), 1  );
+			
+			$m_szState = $szState;
+		}
+	}
+	
+	# write the total and elipsed time of the current song
+	$pobjGLCD->SetXY(0, 3);
+	$pobjGLCD->Print( GetFormatedTime($m_nTimeElapsed)." / ".GetFormatedTime($m_nTimeTotal) , 1  );
+	if ($m_szState eq "play")
+	{
+		$m_nTimeElapsed++;
+	}
+	
+	
+	if (  ( $m_nLocalTime < (time() - 5) ) or ( $m_nLocalTime > (time() + 5) ) or ($m_fMainScreenIsInit == 0)  )
+	{
+		$m_nLocalTime = time();
+	}
+	else
+	{
+		$m_nLocalTime++;
+	}
+	
+	if (  ( ($m_nLocalTime % 60) == 0 ) or ($m_fMainScreenIsInit == 0)  )
+	{
+		my $szTime = POSIX::strftime( "%H:%M:%S", localtime($m_nLocalTime) );
+		$pobjGLCD->SetXY(0, 6);
+		$pobjGLCD->Print( $szTime , 2  );
+	}
+	else
+	{
+		my $szTime = POSIX::strftime( "%S", localtime($m_nLocalTime) );
+		$pobjGLCD->SetXY(96, 6);
+		$pobjGLCD->Print( $szTime , 2  );
+	}
+	
+	if (    (  ( $m_nLocalTime % (24 * 3600) ) == 0  ) or ($m_fMainScreenIsInit == 0)    )
+	{
+		my $szDate = POSIX::strftime( "%A, %e. %B %Y", localtime($m_nLocalTime) );
+		$pobjGLCD->SetXY(0, 5);
+		$pobjGLCD->Print( $szDate , 1 );
+	}
+	
+	
+	# set Info text if available
+	if ($m_szInfo ne "")
+	{
+		$pobjGLCD->SetScrollingText(2, 4, $m_szInfo, 1);
+		
+		$m_nInfoTimer = 0;
+		$m_szInfo = "";
+	}
+		
+	if ($m_nInfoTimer == 30)
+	{
+		$pobjGLCD->DeleteScrollingText(2);
+		$pobjGLCD->Clear(4, 4);
+	}
+	elsif ($m_nInfoTimer <= 30)
+	{
+		$m_nInfoTimer++;
+	}
+	
+	$m_fMainScreenIsInit = 1;
+}
+
+sub ExecReceivedCommands
+{
+	while ( my $szCommand = $m_pobjQueue->dequeue_nb() )
+	{
+		Logger->GetInstance()->Write( undef, 2, "Command '$szCommand' received" );
+		
+		if ($szCommand eq "up")
+		{
+			$objMPD->play();
+		}
+		elsif ($szCommand eq "down")
+		{
+			$objMPD->pause();
+		}
+		elsif ($szCommand eq "right")
+		{
+			NextTrack();
+		}
+		elsif ($szCommand eq "play")
+		{
+			$objMPD->play();
+		}
+		elsif ($szCommand eq "pause")
+		{
+			$objMPD->pause();
+		}
+		elsif ($szCommand eq "next")
+		{
+			NextTrack();
+		}
+		elsif ($szCommand eq "rmerr")
+		{
+			MoveDefectTrack(0);
+		}
+		elsif ($szCommand eq "rmlasterr")
+		{
+			MoveDefectTrack(1);
+		}
+	}
+}
+
+sub IsMPDAvailable
+{
+	my $fIsMPDAvailable = 0;
+	eval
+	{
+		if ( (defined $objMPD) and 
+			 ($objMPD->ping() == 0) and 
+			 (defined $objMPD->current) and 
+			 (defined $objMPD->playlist) and 
+			 (defined $objMPD->status) and 
+			 (defined $objMPD->status->time) )
+		{
+			$fIsMPDAvailable = 1;
+		}
+	};
+	
+	if ($@)
+	{
+		Logger->GetInstance()->Write( undef, 1, "MPD not available: $@" );
+	}
+	
+	return $fIsMPDAvailable;
+}
+
+sub GetFormatedTime
+{
+	my ($nTime) = @_;
+	
+	return sprintf( "%02d:%02d", int($nTime / 60), ($nTime % 60) );
+}
+
+sub NextTrack
+{
+	my $szMusicFile = $m_szCurSong;
+	
+	$objMPD->next();
+	
+	my %mpfSortOutFiles = ();
+	if (-f $SORTOUT_FILE)
+	{
+		%mpfSortOutFiles = %{  Storable::retrieve( $SORTOUT_FILE ) };
+	}
+	
+	if ( (defined $mpfSortOutFiles{$szMusicFile}) and ($mpfSortOutFiles{$szMusicFile} == 1) )
+	{
+		MoveFile( $szMusicFile, $SORTOUT_DIR );
+		
+		delete $mpfSortOutFiles{$szMusicFile};
+	}
+	else
+	{
+		$m_szInfo = "Song '$szMusicFile' wird beim nächsten mal aussortiert.";
+		Logger->GetInstance()->Write( undef, 2, "Das Lied '$szMusicFile' wird gespeichert und beim nächsten Weiterschalten aussortiert" );
+		$mpfSortOutFiles{$szMusicFile} = 1;
+	}
+	
+	Storable::store( \%mpfSortOutFiles, $SORTOUT_FILE );
+}
+
+sub MoveDefectTrack
+{
+	my ($fLastFile) = @_;
+	
+	my $szFile = $m_szLastSong;
+	if ($fLastFile == 0)
+	{
+		$szFile = $m_szCurSong;
+		$objMPD->next();
+	}
+	
+	MoveFile( $szFile, $ERROR_DIR );
+}
+
+sub MoveFile
+{
+	my ($szMusicFile, $szDestDir) = @_;
+	
+	my $szSrcFile = $MUSIC_DIR . "/" . $szMusicFile;
+	my $szDestFile = $szDestDir . "/" . File::Basename::basename($szSrcFile);
+	
+	$m_szInfo = "Song '$szMusicFile' wurde ins Fehlerverzeichnis verschoben.";
+	Logger->GetInstance()->Write( undef, 2, "Das Lied '$szSrcFile' wird nach '$szDestFile' verschoben" );	
+	File::Copy::move ( $szSrcFile, $szDestFile );
+}

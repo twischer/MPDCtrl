@@ -1,0 +1,20 @@
+#!/usr/bin/perl -w
+use strict;
+use warnings;
+use IO::Socket();
+
+
+my $HOST = "player.local";
+my $PORT = 8061;
+
+my $pobjClient = IO::Socket::INET->new(
+	PeerAddr => $HOST,
+	PeerPort => $PORT,
+	Proto => 'tcp'
+	);
+die "FATAL: Could not connect to server (".$HOST.":".$PORT."): $!\r\n" unless $pobjClient;
+
+
+print "Connected to server (".$HOST.":".$PORT.").\r\n";
+$pobjClient->send( $ARGV[0] );
+print "Connection closed.\r\n";
